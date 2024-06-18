@@ -2,7 +2,7 @@ use std::net::{TcpListener, TcpStream};
 use std::io::{Read, Write};
 use std::fs::File;
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::str;
 
@@ -35,6 +35,11 @@ fn parse_config() -> Vec<ServerConfig> {
             current_config.proxy_pass = line.split_whitespace().nth(1).unwrap().replace(";", "");
         } else if line == "}" {
             configs.push(current_config.clone());
+            current_config = ServerConfig {
+                servername: String::new(),
+                port: 80,
+                proxy_pass: String::new(),
+            };
         }
     }
 
@@ -58,8 +63,10 @@ fn handle_client(mut stream: TcpStream, config: Arc<HashMap<String, ServerConfig
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>MiHTTP</title></head><body><h1>Welcome to MiHTTP</h1><p>Your reverse proxy server is running!</p></body></html>".to_string()
     } else if let Some(server_config) = config.get(host) {
         let uri = format!("{}{}", server_config.proxy_pass, request.lines().next().unwrap().split_whitespace().nth(1).unwrap());
-        let response = forward_request(&uri);
-        response
+        match forward_request(&uri) {
+            Ok(response) => response,
+            Err(_) => "HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/plain\r\n\r\n502 Bad Gateway".to_string(),
+        }
     } else {
         "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found".to_string()
     };
@@ -68,28 +75,34 @@ fn handle_client(mut stream: TcpStream, config: Arc<HashMap<String, ServerConfig
     stream.flush().unwrap();
 }
 
-fn forward_request(uri: &str) -> String {
+fn forward_request(uri: &str) -> Result<String, std::io::Error> {
     let mut parts = uri.split('/');
     let host = parts.next().unwrap();
     let path = parts.collect::<Vec<&str>>().join("/");
 
-    let mut stream = TcpStream::connect(host).unwrap();
+    let mut stream = TcpStream::connect(host)?;
     let request = format!("GET /{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
-    stream.write(request.as_bytes()).unwrap();
-    stream.flush().unwrap();
+    stream.write(request.as_bytes())?;
+    stream.flush()?;
 
     let mut buffer = Vec::new();
-    stream.read_to_end(&mut buffer).unwrap();
-    String::from_utf8(buffer).unwrap()
+    stream.read_to_end(&mut buffer)?;
+
+    Ok(String::from_utf8(buffer).unwrap())
 }
 
-fn main() {
+fn load_config() -> Arc<HashMap<String, ServerConfig>> {
+    println!("Loading configuration from config.conf...");
     let configs = parse_config();
     let mut config_map = HashMap::new();
     for config in configs {
         config_map.insert(config.servername.clone(), config);
     }
-    let config = Arc::new(config_map);
+    Arc::new(config_map)
+}
+
+fn main() {
+    let config = load_config();
 
     let listener = TcpListener::bind("0.0.0.0:80").unwrap();
     println!("Listening on port 80");
@@ -99,7 +112,7 @@ fn main() {
             Ok(stream) => {
                 let config = Arc::clone(&config);
                 thread::spawn(move || {
-                    handle_client(stream, config);
+                    handle_client(stream, Arc::clone(&config));
                 });
             }
             Err(e) => {
