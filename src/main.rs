@@ -1,16 +1,10 @@
-use hyper::{Body, Client, Request, Response, Server};
-use hyper::service::{make_service_fn, service_fn};
-use hyper::client::HttpConnector;
-use tokio::fs::File;
-use tokio::io::AsyncReadExt;
-use std::sync::Arc;
+use std::net::{TcpListener, TcpStream};
+use std::io::{Read, Write};
+use std::fs::File;
 use std::collections::HashMap;
-use nom::bytes::complete::{tag, take_while1};
-use nom::character::complete::multispace0;
-use nom::sequence::{delimited, pair};
-use nom::combinator::map;
-use nom::multi::many0;
-use nom::IResult;
+use std::sync::Arc;
+use std::thread;
+use std::str;
 
 #[derive(Debug, Clone)]
 struct ServerConfig {
@@ -19,107 +13,98 @@ struct ServerConfig {
     proxy_pass: String,
 }
 
-fn parse_word(input: &str) -> IResult<&str, &str> {
-    take_while1(|c: char| c.is_alphanumeric() || c == '.' || c == ':')(input)
-}
-
-fn parse_server(input: &str) -> IResult<&str, ServerConfig> {
-    let (input, _) = tag("server")(input)?;
-    let (input, _) = multispace0(input)?;
-    let (input, _) = tag("{")(input)?;
-    let (input, _) = multispace0(input)?;
-
-    let (input, servername) = map(
-        delimited(pair(tag("servername"), multispace0), parse_word, tag(";")),
-        |s: &str| s.to_string(),
-    )(input)?;
-    let (input, _) = multispace0(input)?;
-
-    let (input, port) = map(
-        delimited(pair(tag("port"), multispace0), parse_word, tag(";")),
-        |s: &str| s.parse::<u16>().unwrap(),
-    )(input)?;
-    let (input, _) = multispace0(input)?;
-
-    let (input, proxy_pass) = map(
-        delimited(pair(tag("proxy_pass"), multispace0), parse_word, tag(";")),
-        |s: &str| s.to_string(),
-    )(input)?;
-    let (input, _) = multispace0(input)?;
-
-    let (input, _) = tag("}")(input)?;
-
-    Ok((input, ServerConfig {
-        servername,
-        port,
-        proxy_pass,
-    }))
-}
-
-fn parse_config(input: &str) -> IResult<&str, Vec<ServerConfig>> {
-    many0(delimited(multispace0, parse_server, multispace0))(input)
-}
-
-async fn load_config() -> Vec<ServerConfig> {
-    let mut file = File::open("config.conf").await.expect("Config file not found");
+fn parse_config() -> Vec<ServerConfig> {
+    let mut file = File::open("config.conf").expect("Config file not found");
     let mut contents = String::new();
-    file.read_to_string(&mut contents).await.expect("Failed to read config file");
+    file.read_to_string(&mut contents).expect("Failed to read config file");
 
-    match parse_config(&contents) {
-        Ok((_, config)) => config,
-        Err(err) => panic!("Failed to parse config file: {:?}", err),
-    }
-}
+    let mut configs = Vec::new();
+    let mut current_config = ServerConfig {
+        servername: String::new(),
+        port: 80,
+        proxy_pass: String::new(),
+    };
 
-async fn proxy(
-    req: Request<Body>,
-    client: Arc<Client<HttpConnector>>,
-    config: Arc<HashMap<String, ServerConfig>>,
-) -> Result<Response<Body>, hyper::Error> {
-    let host = req.headers().get("host").and_then(|h| h.to_str().ok()).unwrap_or("");
-    if host.is_empty() || req.uri().path() == "/" {
-        // トップ画面を返す
-        Ok(Response::new(Body::from("<html><head><title>MiHTTP</title></head><body><h1>Welcome to MiHTTP</h1><p>Your reverse proxy server is running!</p></body></html>")))
-    } else {
-        if let Some(server_config) = config.get(host) {
-            let uri = format!("{}{}", server_config.proxy_pass, req.uri().path_and_query().map(|x| x.as_str()).unwrap_or(""));
-            let proxied_request = Request::builder()
-                .method(req.method())
-                .uri(uri)
-                .body(req.into_body())
-                .unwrap();
-            client.request(proxied_request).await
-        } else {
-            Ok(Response::builder().status(404).body(Body::from("Not Found")).unwrap())
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.starts_with("servername") {
+            current_config.servername = line.split_whitespace().nth(1).unwrap().replace(";", "");
+        } else if line.starts_with("port") {
+            current_config.port = line.split_whitespace().nth(1).unwrap().replace(";", "").parse().unwrap();
+        } else if line.starts_with("proxy_pass") {
+            current_config.proxy_pass = line.split_whitespace().nth(1).unwrap().replace(";", "");
+        } else if line == "}" {
+            configs.push(current_config.clone());
         }
     }
+
+    configs
 }
 
-#[tokio::main]
-async fn main() {
-    let configs = load_config().await;
+fn handle_client(mut stream: TcpStream, config: Arc<HashMap<String, ServerConfig>>) {
+    let mut buffer = [0; 1024];
+    stream.read(&mut buffer).unwrap();
+    let request = str::from_utf8(&buffer).unwrap();
+
+    let host_line = request.lines().find(|line| line.starts_with("Host:"));
+    let host = if let Some(host_line) = host_line {
+        host_line.split_whitespace().nth(1).unwrap()
+    } else {
+        ""
+    };
+
+    let response = if host.is_empty() || request.lines().next().unwrap().contains("/") {
+        // トップ画面を返す
+        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><head><title>MiHTTP</title></head><body><h1>Welcome to MiHTTP</h1><p>Your reverse proxy server is running!</p></body></html>".to_string()
+    } else if let Some(server_config) = config.get(host) {
+        let uri = format!("{}{}", server_config.proxy_pass, request.lines().next().unwrap().split_whitespace().nth(1).unwrap());
+        let response = forward_request(&uri);
+        response
+    } else {
+        "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found".to_string()
+    };
+
+    stream.write(response.as_bytes()).unwrap();
+    stream.flush().unwrap();
+}
+
+fn forward_request(uri: &str) -> String {
+    let mut parts = uri.split('/');
+    let host = parts.next().unwrap();
+    let path = parts.collect::<Vec<&str>>().join("/");
+
+    let mut stream = TcpStream::connect(host).unwrap();
+    let request = format!("GET /{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", path, host);
+    stream.write(request.as_bytes()).unwrap();
+    stream.flush().unwrap();
+
+    let mut buffer = Vec::new();
+    stream.read_to_end(&mut buffer).unwrap();
+    String::from_utf8(buffer).unwrap()
+}
+
+fn main() {
+    let configs = parse_config();
     let mut config_map = HashMap::new();
     for config in configs {
         config_map.insert(config.servername.clone(), config);
     }
     let config = Arc::new(config_map);
-    let client = Arc::new(Client::new());
 
-    let make_svc = make_service_fn(|_conn| {
-        let client = Arc::clone(&client);
-        let config = Arc::clone(&config);
-        async {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                proxy(req, Arc::clone(&client), Arc::clone(&config))
-            }))
+    let listener = TcpListener::bind("0.0.0.0:80").unwrap();
+    println!("Listening on port 80");
+
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                let config = Arc::clone(&config);
+                thread::spawn(move || {
+                    handle_client(stream, config);
+                });
+            }
+            Err(e) => {
+                eprintln!("Connection failed: {}", e);
+            }
         }
-    });
-
-    let addr = ([0, 0, 0, 0], 80).into();
-    let server = Server::bind(&addr).serve(make_svc);
-
-    println!("Listening on http://{}", addr);
-    if let Err(e) = server.await {
-        eprintln!("server error: {}", e);
     }
 }
